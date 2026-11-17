@@ -275,9 +275,11 @@ function render(){
 }
 
 function renderAlreadyDone(){
+  const vid = videoEmbedPlain();
   $("#main").innerHTML = `
     <h1 style="font-size:22px;">Ya completaste este módulo</h1>
-    <p class="lede">Tu certificado ya quedó registrado. Si necesitas verlo de nuevo, contacta a Compliance.</p>
+    <p class="lede">Tu certificado ya quedó registrado. Puedes ver el video las veces que quieras. No tienes que volver a hacer el examen.</p>
+    ${vid ? `<div class="video-slot">${vid}</div>` : ""}
     <a class="btn btn-primary" href="index.html" style="display:block;text-decoration:none;box-sizing:border-box;">Volver al inicio</a>
   `;
 }
@@ -294,34 +296,132 @@ function renderIntro(){
 
 function goVideo(){ STATE.step="video"; render(); startVideoTimer(); }
 
+
+const VT = {"press": "Dale ▶ al video para empezar el conteo", "cont": "Continúa en {t}…", "paused": "En pausa · faltan {t}", "ready": "Listo."};
+function fmtTime(s){ s=Math.max(0,Math.ceil(s)); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); }
+
+function ytIframeHtml(){
+  return `<iframe src="https://www.youtube.com/embed/${CONFIG.youtubeId}?rel=0&playsinline=1" allow="autoplay; encrypted-media" allowfullscreen></iframe>`;
+}
+
+/* Video simple, sin conteo (modo repaso y fallback) */
+function videoEmbedPlain(){
+  if (CONFIG.youtubeId) return ytIframeHtml();
+  if (CONFIG.videoUrl) return `<video src="${CONFIG.videoUrl}" controls playsinline></video>`;
+  return "";
+}
+
 function videoEmbed(){
-  if (CONFIG.youtubeId) return `<iframe src="https://www.youtube.com/embed/${CONFIG.youtubeId}?rel=0" allow="autoplay; encrypted-media" allowfullscreen></iframe>`;
+  if (CONFIG.youtubeId) return `<div id="ytPlayer"></div>`;
   if (CONFIG.videoUrl) return `<video src="${CONFIG.videoUrl}" controls playsinline></video>`;
   return `<div class="video-placeholder"><div class="play">▶</div>Aquí va tu video (20–60 seg).<br>Configura <b>youtubeId</b> o <b>videoUrl</b> arriba en CONFIG.</div>`;
 }
 
 function renderVideo(){
+  const useApi = !!CONFIG.youtubeId;
   $("#main").innerHTML = `
     <h1 style="font-size:22px;">${esc(CONFIG.titleEs)}</h1>
     <div class="video-slot">${videoEmbed()}</div>
-    <div class="timer-note" id="timerNote">Continúa en ${CONFIG.minSecondsBeforeContinue}s…</div>
+    <div class="timer-note" id="timerNote">${useApi ? VT.press : VT.cont.replace("{t}", fmtTime(CONFIG.minSecondsBeforeContinue))}</div>
     <button class="btn btn-primary" id="continueBtn" disabled onclick="goQuiz()">Ya vi el video, continuar</button>
   `;
 }
 
-function startVideoTimer(){
+function stopVideoTimer(){
+  clearInterval(STATE.videoTimer);
+  const V = STATE.vid;
+  if (V){ clearTimeout(V.fbTimer); V.done = true; try{ if (V.player && V.player.destroy) V.player.destroy(); }catch(e){} }
+  STATE.vid = null;
+}
+
+/* Conteo fijo (fallback si la API de YouTube no carga, o video sin YouTube) */
+function startFixedCountdown(){
   let left = CONFIG.minSecondsBeforeContinue;
   clearInterval(STATE.videoTimer);
+  const n0 = $("#timerNote"); if (n0) n0.textContent = VT.cont.replace("{t}", fmtTime(left));
   STATE.videoTimer = setInterval(()=>{
     left--;
     const note = $("#timerNote"), btn = $("#continueBtn");
     if (!note || !btn) { clearInterval(STATE.videoTimer); return; }
-    if (left<=0){ note.textContent="Listo."; btn.disabled=false; clearInterval(STATE.videoTimer); }
-    else note.textContent = `Continúa en ${left}s…`;
+    if (left<=0){ note.textContent=VT.ready; btn.disabled=false; clearInterval(STATE.videoTimer); }
+    else note.textContent = VT.cont.replace("{t}", fmtTime(left));
   },1000);
 }
 
-function goQuiz(){ STATE.step="quiz"; if(STATE.selected.length===0) STATE.selected = new Array(CONFIG.questions.length).fill(null); render(); }
+/* Conteo con YouTube IFrame API: empieza al darle ▶, se pausa con el video,
+   cuenta solo tiempo realmente reproducido (x velocidad), dura duración − 1 s. */
+function startVideoTimer(){
+  stopVideoTimer();
+  if (!CONFIG.youtubeId){ startFixedCountdown(); return; }
+  const V = STATE.vid = { player:null, ready:false, state:-1, started:false, played:0, required:null,
+                          last:performance.now(), done:false, fallback:false, fbTimer:null };
+
+  function rate(){ let r=1; try{ r = V.player.getPlaybackRate() || 1; }catch(e){} return r; }
+  function reqSeconds(){
+    if (V.required!==null) return V.required;
+    let d=0; try{ d = V.player.getDuration(); }catch(e){}
+    if (d>1){ V.required = d-1; return V.required; }
+    return V.started ? CONFIG.minSecondsBeforeContinue : null;
+  }
+  function init(){
+    if (V.player || V.fallback || V.done) return;
+    const pv = { rel:0, playsinline:1, enablejsapi:1 };
+    if (/^https?:$/.test(location.protocol)) pv.origin = location.origin;
+    V.player = new YT.Player("ytPlayer", {
+      videoId: CONFIG.youtubeId, playerVars: pv,
+      events: {
+        onReady: ()=>{ V.ready = true; },
+        onStateChange: e=>{ V.state = e.data; if (e.data===1) V.started = true; }
+      }
+    });
+  }
+
+  if (window.YT && window.YT.Player) init();
+  else {
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = function(){ if (typeof prev==="function") prev(); init(); };
+    if (!document.getElementById("ytApiScript")){
+      const s = document.createElement("script");
+      s.id = "ytApiScript"; s.src = "https://www.youtube.com/iframe_api"; s.async = true;
+      document.head.appendChild(s);
+    }
+  }
+
+  // Si la API no carga en 10 s: video normal + conteo fijo del CONFIG
+  V.fbTimer = setTimeout(()=>{
+    if (V.ready || V.done) return;
+    V.fallback = true;
+    try{ if (V.player && V.player.destroy) V.player.destroy(); }catch(e){}
+    const slot = document.querySelector(".video-slot");
+    if (slot) slot.innerHTML = ytIframeHtml();
+    startFixedCountdown();
+  }, 10000);
+
+  STATE.videoTimer = setInterval(()=>{
+    const note = $("#timerNote"), btn = $("#continueBtn");
+    if (!note || !btn){ stopVideoTimer(); return; }
+    if (V.fallback || V.done) return;
+    const now = performance.now();
+    let dt = (now - V.last)/1000; V.last = now;
+    if (dt<0) dt=0; if (dt>3) dt=3;
+    if (V.ready){ try{ V.state = V.player.getPlayerState(); }catch(e){} }
+    if (V.state===1){ V.started = true; V.played += dt*rate(); }
+    if (!V.started){ note.textContent = VT.press; return; }
+    const req = reqSeconds();
+    if (req===null){ note.textContent = VT.cont.replace("{t}","…"); return; }
+    const rem = req - V.played;
+    if (rem<=0){
+      V.done = true; clearInterval(STATE.videoTimer);
+      note.textContent = VT.ready; btn.disabled = false; return;
+    }
+    const t = fmtTime(rem/rate());
+    note.textContent = ((V.state===1 || V.state===3) ? VT.cont : VT.paused).replace("{t}", t);
+  }, 250);
+}
+
+
+
+function goQuiz(){ stopVideoTimer(); STATE.step="quiz"; if(STATE.selected.length===0) STATE.selected = new Array(CONFIG.questions.length).fill(null); render(); }
 
 function renderQuiz(){
   const qHtml = CONFIG.questions.map((q,qi)=>`
